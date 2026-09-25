@@ -4019,9 +4019,11 @@ impl VaultDAO {
     /// * `amount`    - Amount the recipient wishes to claim now.
     ///
     /// # Errors
-    /// * `StreamDustRejected`       ? amount is below the minimum dust threshold (10 stroops).
-    /// * `StreamRateLimitExceeded`  ? cumulative outflow in the current window would be exceeded.
-    /// * `InsufficientBalance`      ? vault lacks sufficient funds.
+    /// * `StreamDustRejected`         — amount is below the minimum dust threshold (10 stroops).
+    /// * `StreamClaimExceedsAccrued`  — amount exceeds what the stream has accrued minus already
+    ///                                  claimed, or exceeds `total_amount` (Issue #1694).
+    /// * `StreamRateLimitExceeded`    — cumulative outflow in the current window would be exceeded.
+    /// * `InsufficientBalance`        — vault lacks sufficient funds.
     pub fn trigger_stream_payment(
         env: Env,
         caller: Address,
