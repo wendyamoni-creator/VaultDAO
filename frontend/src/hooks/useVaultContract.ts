@@ -465,8 +465,7 @@ export const useVaultContract = () => {
 // Fetch balance, config, and proposals in parallel
 const [accountInfo, configResult, proposalsResult] = await Promise.allSettled([
     server.getAccount(env.contractId) as Promise<unknown>,
-    readContractValue('get_config').catch(() => null).then(r =>
-        r ?? readContractValue('get_vault_config').catch(() => null)),
+    readContractValue('get_config').catch(() => null),
     // Inline event fetch to avoid forward-reference to getVaultEvents
     (async () => {
         const latestRes = await fetch(env.sorobanRpcUrl, {
@@ -586,16 +585,14 @@ return { totalBalance: balance, totalProposals, pendingApprovals, readyToExecute
         if (env.demoMode) {
             return { ...DEMO_VAULT_CONFIG };
         }
-        const [configRawPrimary, configRawLegacy, userRole, isSigner] = await Promise.all([
+        const [configRaw, userRole, isSigner] = await Promise.all([
             readContractValue('get_config').catch(() => null),
-            readContractValue('get_vault_config').catch(() => null),
             getUserRole(),
             address
                 ? readContractValue('is_signer', [new Address(address).toScVal()]).then((value) => Boolean(value)).catch(() => false)
                 : Promise.resolve(false),
         ]);
 
-        const configRaw = configRawPrimary ?? configRawLegacy;
         const configObject = ((configRaw && typeof configRaw === 'object') ? configRaw : {}) as Record<string, unknown>;
 
         const signers = parseSignerAddresses(configObject.signers);
@@ -782,36 +779,16 @@ return { totalBalance: balance, totalProposals, pendingApprovals, readyToExecute
         }
     };
 
-    const addSigner = async (signer: string) => {
-        const _addr = assertReady();
-        setLoading(true);
-        try {
-            const account = await server.getAccount(_addr);
-            const tx = new TransactionBuilder(account, { fee: "100" })
-                .setNetworkPassphrase(env.networkPassphrase)
-                .setTimeout(30)
-                .addOperation(Operation.invokeHostFunction({
-                    func: xdr.HostFunction.hostFunctionTypeInvokeContract(
-                        new xdr.InvokeContractArgs({
-                            contractAddress: Address.fromString(env.contractId).toScAddress(),
-                            functionName: "add_signer",
-                            args: [new Address(_addr).toScVal(), new Address(signer).toScVal()],
-                        })
-                    ),
-                    auth: [],
-                }))
-                .build();
-            const simulation = await server.simulateTransaction(tx);
-            if (SorobanRpc.Api.isSimulationError(simulation)) throwSimulationError(simulation.error, "Simulation failed");
-            const preparedTx = SorobanRpc.assembleTransaction(tx, simulation).build();
-            const signedXdr = await signTransaction(preparedTx.toXDR(), { network: env.stellarNetwork });
-            const response = await server.sendTransaction(TransactionBuilder.fromXDR(signedXdr as string, env.networkPassphrase));
-            return response.hash;
-        } catch (e: unknown) {
-            throw parseError(e);
-        } finally {
-            setLoading(false);
-        }
+    const addSigner = async (_signer: string): Promise<string> => {
+        // The VaultDAO contract has no direct add_signer entry point.
+        // Signer set changes are governance actions: call update_config_signers
+        // via a propose_config_change proposal and execute it once approved.
+        // This function is intentionally not implemented as a direct contract
+        // call — use proposeTransfer / the Admin Panel governance flow instead.
+        throw new Error(
+            'Adding a signer requires a governance proposal (update_config_signers). ' +
+            'Please use the Admin Panel to raise a config-change proposal.'
+        );
     };
 
     const removeSigner = async (signer: string) => {
@@ -1089,11 +1066,7 @@ return { totalBalance: balance, totalProposals, pendingApprovals, readyToExecute
     const getProposalSignatures = useCallback(async (proposalId: number) => {
         try {
 // Get the full signer list from vault config
-const [configPrimary, configLegacy] = await Promise.all([
-    readContractValue('get_config').catch(() => null),
-    readContractValue('get_vault_config').catch(() => null),
-]);
-const configRaw = configPrimary ?? configLegacy;
+const configRaw = await readContractValue('get_config').catch(() => null);
 const configObject = ((configRaw && typeof configRaw === 'object') ? configRaw : {}) as Record<string, unknown>;
 const allSigners = parseSignerAddresses(configObject.signers);
 
