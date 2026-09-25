@@ -6633,6 +6633,9 @@ fn test_get_config_after_init() {
 }
 
 /// get_config reflects updates made via update_threshold.
+///
+/// Uses threshold=2 at init (minimum allowed, Issue #1523) and raises to 3
+/// via update_threshold (immediate increase path, Issue #1693).
 #[test]
 fn test_get_config_reflects_updates() {
     let env = Env::default();
@@ -6650,19 +6653,20 @@ fn test_get_config_reflects_updates() {
     signers.push_back(signer1.clone());
     signers.push_back(signer2.clone());
 
-    let init_cfg = default_init_config(&env, signers.clone(), 1);
+    // Initialize with minimum valid threshold (2).
+    let init_cfg = default_init_config(&env, signers.clone(), 2);
     client.initialize(&admin, &init_cfg);
 
     // Confirm initial threshold
     let config_before = client.get_config();
-    assert_eq!(config_before.threshold, 1);
+    assert_eq!(config_before.threshold, 2);
 
-    // Update threshold via the public admin function
-    client.update_threshold(&admin, &2);
+    // Increase threshold — applied immediately (no governance needed).
+    client.update_threshold(&admin, &3);
 
     // get_config should now reflect the new threshold
     let config_after = client.get_config();
-    assert_eq!(config_after.threshold, 2);
+    assert_eq!(config_after.threshold, 3);
     // Other fields remain unchanged
     assert_eq!(config_after.spending_limit, config_before.spending_limit);
     assert_eq!(config_after.daily_limit, config_before.daily_limit);

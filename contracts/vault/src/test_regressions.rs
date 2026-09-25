@@ -409,10 +409,10 @@ fn test_threshold_above_signers_count_rejected() {
     signers.push_back(admin.clone());
     signers.push_back(signer.clone());
 
-    // 2 signers, threshold = 1 (valid)
+    // 2 signers, threshold = 2 (minimum valid, Issue #1523)
     client.initialize(
         &admin,
-        &init_config(&env, signers, 1, ThresholdStrategy::Fixed),
+        &init_config(&env, signers, 2, ThresholdStrategy::Fixed),
     );
 
     // Attempt to raise threshold to 3, which exceeds the 2-signer count

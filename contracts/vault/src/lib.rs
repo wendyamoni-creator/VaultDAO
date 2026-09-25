@@ -464,6 +464,8 @@ mod test_signers_with_roles;
 #[cfg(test)]
 mod test_threshold_min_init;
 #[cfg(test)]
+mod test_threshold_unilateral_reduction;
+#[cfg(test)]
 mod test_proposal_veto_event;
 #[cfg(test)]
 mod test_remove_signer_threshold;
@@ -3910,10 +3912,38 @@ impl VaultDAO {
     // ========================================================================
     // Admin Functions
     // ========================================================================
-    /// Update threshold
+    /// Update the signing threshold.
     ///
-    /// Only Admin can update threshold.
-    pub fn update_threshold(env: Env, admin: Address, threshold: u32) -> Result<(), VaultError> {
+    /// # Security (Issue #1693)
+    /// Lowering the threshold is a high-impact action: a threshold of 1 lets a
+    /// single compromised key drain the vault.  Two distinct paths are enforced:
+    ///
+    /// **Threshold increase (or unchanged):** applied immediately by the Admin.
+    /// Raising the bar is strictly safer and needs no extra protection.
+    ///
+    /// **Threshold reduction:** routed through `propose_vault_config_change`.
+    /// The proposal requires `threshold`-of-N approvals *and* a timelock of
+    /// `config.timelock_delay` ledgers before it can be executed.  Returns the
+    /// governance proposal ID as `Ok(Some(proposal_id))`.
+    ///
+    /// Immediate increases return `Ok(None)`.
+    ///
+    /// # Minimum threshold
+    /// The vault minimum is **2** (same as `initialize`, Issue #1523).  Any
+    /// attempt to set `threshold < 2` is rejected with `ThresholdTooLow`
+    /// regardless of the path taken.
+    ///
+    /// # Errors
+    /// - [`VaultError::Unauthorized`] if caller is not an Admin.
+    /// - [`VaultError::ThresholdTooLow`] if `threshold < 2`.
+    /// - [`VaultError::ThresholdTooHigh`] if `threshold > len(signers)`.
+    /// - [`VaultError::ConfigChangeInProgress`] if a reduction proposal is
+    ///   already pending (reduction path only).
+    pub fn update_threshold(
+        env: Env,
+        admin: Address,
+        threshold: u32,
+    ) -> Result<Option<u64>, VaultError> {
         admin.require_auth();
 
         let role = storage::get_role(&env, &admin);
@@ -3921,25 +3951,135 @@ impl VaultDAO {
             return Err(VaultError::Unauthorized);
         }
 
-        let mut config = storage::get_config(&env)?;
+        let config = storage::get_config(&env)?;
 
-        if threshold < 1 {
-            return Err(VaultError::ThresholdTooHigh);
+        // Enforce minimum of 2 — same invariant as initialize (Issue #1523).
+        if threshold < 2 {
+            return Err(VaultError::ThresholdTooLow);
         }
         if threshold > config.signers.len() {
             return Err(VaultError::ThresholdTooHigh);
         }
 
-        config.threshold = threshold;
-        storage::set_config(&env, &config);
+        if threshold < config.threshold {
+            // ── Threshold reduction: requires governance + timelock ──────────
+            // Build a new config with the reduced threshold and route it
+            // through the multisig config-change proposal workflow.
+            let mut new_config = config.clone();
+            new_config.threshold = threshold;
+            let proposal_id =
+                Self::propose_vault_config_change_with_timelock(env, admin, new_config)?;
+            Ok(Some(proposal_id))
+        } else {
+            // ── Threshold increase (or unchanged): apply immediately ─────────
+            let mut new_config = config;
+            new_config.threshold = threshold;
+            storage::set_config(&env, &new_config);
+            storage::extend_instance_ttl(&env);
+            storage::create_audit_entry(&env, AuditAction::UpdateThreshold, &admin, 0);
+            events::emit_config_updated(&env, &admin);
+            Ok(None)
+        }
+    }
+
+    /// Internal helper: like `propose_vault_config_change` but always sets
+    /// `unlock_ledger` to enforce the vault's configured timelock delay.
+    ///
+    /// Used by threshold-reduction path so that even after collecting enough
+    /// approvals the execution is blocked until the timelock has elapsed.
+    fn propose_vault_config_change_with_timelock(
+        env: Env,
+        proposer: Address,
+        new_config: Config,
+    ) -> Result<u64, VaultError> {
+        proposer.require_auth();
+
+        let role = storage::get_role(&env, &proposer);
+        if role != Role::Treasurer && role != Role::Admin {
+            return Err(VaultError::InsufficientRole);
+        }
+
+        if storage::get_pending_config_proposal(&env).is_some() {
+            return Err(VaultError::ConfigChangeInProgress);
+        }
+
+        Self::validate_config(&new_config)?;
+
+        let current_config = storage::get_config(&env)?;
+        let current_ledger = env.ledger().sequence() as u64;
+        let proposal_id = storage::increment_proposal_id(&env);
+
+        // Always apply the vault timelock for threshold-reduction proposals so
+        // that execution is blocked even after threshold approvals are collected.
+        let unlock_ledger = if current_config.timelock_delay > 0 {
+            current_ledger + current_config.timelock_delay
+        } else {
+            // Minimum 1-ledger delay so the timelock path is always distinct
+            // from an immediate execution.
+            current_ledger + 1
+        };
+
+        let proposal = Proposal {
+            id: proposal_id,
+            proposer: proposer.clone(),
+            recipient: proposer.clone(),
+            token: current_config.signers.get(0).unwrap_or(proposer.clone()),
+            amount: 0,
+            memo: Symbol::new(&env, "config_change"),
+            metadata: Map::new(&env),
+            tags: Vec::new(&env),
+            approvals: Vec::new(&env),
+            abstentions: Vec::new(&env),
+            attachments: Vec::new(&env),
+            attachment_merkle_root: BytesN::from_array(&env, &[0u8; 32]),
+            status: ProposalStatus::Pending,
+            priority: Priority::Normal,
+            conditions: Vec::new(&env),
+            condition_logic: ConditionLogic::And,
+            created_at: current_ledger,
+            expires_at: current_ledger + PROPOSAL_EXPIRY_LEDGERS,
+            unlock_ledger,
+            execution_time: None,
+            execution_window_ledgers: 0,
+            insurance_amount: 0,
+            stake_amount: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            snapshot_ledger: current_ledger,
+            snapshot_signers: current_config.signers.clone(),
+            depends_on: Vec::new(&env),
+            is_swap: false,
+            voting_deadline: if current_config.default_voting_deadline > 0 {
+                current_ledger + current_config.default_voting_deadline
+            } else {
+                0
+            },
+            execution_ledger: 0,
+            signer_snapshot: storage::build_signer_snapshot(&env, &current_config.signers),
+            fee_estimate_cache: None,
+            fee_cache_timestamp: 0,
+            spend_day: storage::get_day_number(&env),
+            spend_week: storage::get_week_number(&env),
+            has_spend_buckets: true,
+            approved_at: 0,
+        };
+
+        storage::set_proposal(&env, &proposal);
+        storage::add_to_priority_queue(&env, Priority::Normal as u32, proposal_id);
+
+        env.storage()
+            .persistent()
+            .set(&crate::storage::FeatureKey::PendingConfig, &new_config);
+        env.storage().persistent().extend_ttl(
+            &crate::storage::FeatureKey::PendingConfig,
+            crate::storage::PROPOSAL_TTL / 2,
+            crate::storage::PROPOSAL_TTL,
+        );
+
+        storage::set_pending_config_proposal(&env, proposal_id);
         storage::extend_instance_ttl(&env);
 
-        // Create audit entry
-        storage::create_audit_entry(&env, AuditAction::UpdateThreshold, &admin, 0);
-
-        events::emit_config_updated(&env, &admin);
-
-        Ok(())
+        Ok(proposal_id)
     }
 
     /// Update the vault spending limits.
@@ -5582,7 +5722,11 @@ impl VaultDAO {
         if config.signers.is_empty() {
             return Err(VaultError::NoSigners);
         }
-        if config.threshold < 1 || config.threshold > config.signers.len() {
+        // Issue #1693: enforce the same minimum of 2 as initialize (Issue #1523).
+        if config.threshold < 2 {
+            return Err(VaultError::ThresholdTooLow);
+        }
+        if config.threshold > config.signers.len() {
             return Err(VaultError::ThresholdTooHigh);
         }
         if config.quorum > config.signers.len() {
