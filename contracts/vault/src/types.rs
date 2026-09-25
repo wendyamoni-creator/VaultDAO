@@ -1338,6 +1338,8 @@ pub enum AuditAction {
     UpdateThreshold = 9,
     AbstainProposal = 10,
     AmendProposal = 11,
+    /// Entire signer set replaced via governance-approved proposal (#1692)
+    SignersReplaced = 12,
 }
 
 /// Audit trail entry with cryptographic verification

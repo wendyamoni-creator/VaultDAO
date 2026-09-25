@@ -468,6 +468,8 @@ mod test_proposal_veto_event;
 #[cfg(test)]
 mod test_remove_signer_threshold;
 #[cfg(test)]
+mod test_update_config_signers;
+#[cfg(test)]
 mod test_recurring_payment_max_total_amount;
 #[cfg(test)]
 mod test_whitelist_proposal;
@@ -2509,7 +2511,21 @@ impl VaultDAO {
                                 .persistent()
                                 .get(&crate::storage::FeatureKey::PendingConfig);
                             if let Some(new_config) = stored {
+                                // Issue #1692: record the signer-set replacement in
+                                // the audit trail and emit a dedicated event before
+                                // overwriting the config.
+                                let old_signer_count = {
+                                    let cur = storage::get_config(&env);
+                                    cur.map(|c| c.signers.len()).unwrap_or(0)
+                                };
+                                let new_signer_count = new_config.signers.len();
                                 storage::set_config(&env, &new_config);
+                                Self::finalize_signers_replaced(
+                                    &env,
+                                    &executor,
+                                    old_signer_count,
+                                    new_signer_count,
+                                );
                             }
                             storage::clear_pending_config_proposal(&env);
                             env.storage()
@@ -5031,29 +5047,98 @@ impl VaultDAO {
         Ok(expired_count)
     }
 
-    /// Update the signer list configuration
+    /// Propose replacing the entire signer set.
+    ///
+    /// # Security (Issue #1692)
+    /// Replacing the signer set is a high-impact action that must follow the
+    /// same governance path as any other configuration change:
+    ///
+    /// 1. The caller must hold the Admin or Treasurer role.
+    /// 2. The proposed signer list is validated before the proposal is created:
+    ///    - must not be empty
+    ///    - length must be >= current threshold (so the vault remains executable)
+    ///    - must contain no duplicate addresses
+    /// 3. A full `propose_vault_config_change` proposal is created, which
+    ///    requires `threshold`-of-N approvals before the new config is applied.
+    /// 4. On execution, an `AuditAction::SignersReplaced` entry is written and
+    ///    a `signers_replaced` event is emitted.
+    ///
+    /// The old single-admin write path has been removed entirely; any call site
+    /// that previously relied on the direct write must be migrated to the
+    /// governance proposal workflow.
+    ///
+    /// # Errors
+    /// - [`VaultError::InsufficientRole`] if the caller is not Admin or Treasurer.
+    /// - [`VaultError::NoSigners`] if `signers` is empty.
+    /// - [`VaultError::ThresholdTooHigh`] if `len(signers) < current threshold`.
+    /// - [`VaultError::SignerAlreadyExists`] if `signers` contains duplicate addresses.
+    /// - [`VaultError::ConfigChangeInProgress`] if a config-change proposal is already pending.
     pub fn update_config_signers(
         env: Env,
         admin: Address,
         signers: Vec<Address>,
-    ) -> Result<(), VaultError> {
+    ) -> Result<u64, VaultError> {
         admin.require_auth();
         storage::extend_instance_ttl(&env);
 
-        // Verify admin role
+        // ── 1. Role check ────────────────────────────────────────────────────
         let role = storage::get_role(&env, &admin);
-        if !Role::role_satisfies(Role::Admin, role) {
+        if role != Role::Admin && role != Role::Treasurer {
             return Err(VaultError::InsufficientRole);
         }
 
-        let mut config = storage::get_config(&env)?;
-        config.signers = signers;
-        storage::set_config(&env, &config);
+        // ── 2. Input validation ──────────────────────────────────────────────
+        // 2a. Non-empty list.
+        if signers.is_empty() {
+            return Err(VaultError::NoSigners);
+        }
 
-        // Emit config update event
-        events::emit_config_updated(&env, &admin);
+        let current_config = storage::get_config(&env)?;
 
-        Ok(())
+        // 2b. New list must have at least as many signers as the current threshold
+        //     so the vault remains executable after the change is applied.
+        if signers.len() < current_config.threshold {
+            return Err(VaultError::ThresholdTooHigh);
+        }
+
+        // 2c. No duplicate addresses in the proposed signer list.
+        for i in 0..signers.len() {
+            for j in (i + 1)..signers.len() {
+                if signers.get(i).unwrap() == signers.get(j).unwrap() {
+                    return Err(VaultError::SignerAlreadyExists);
+                }
+            }
+        }
+
+        // ── 3. Build the proposed config and route through governance ────────
+        // Clone the current config and swap in the new signer list.  All other
+        // fields (threshold, limits, …) remain unchanged so validate_config
+        // only needs to pass the signer-count / threshold relationship.
+        let mut new_config = current_config.clone();
+        new_config.signers = signers;
+
+        // propose_vault_config_change runs validate_config internally and also
+        // enforces the "only one config change at a time" guard.
+        let proposal_id = Self::propose_vault_config_change(env, admin, new_config)?;
+
+        Ok(proposal_id)
+    }
+
+    /// Apply a previously governance-approved signer-set replacement.
+    ///
+    /// This is called internally by the proposal execution path whenever a
+    /// `config_change` proposal is executed and the pending config contains a
+    /// different signer set.  It writes the audit entry and emits the dedicated
+    /// `signers_replaced` event so off-chain indexers can distinguish a full
+    /// signer-set replacement from other config updates.
+    pub(crate) fn finalize_signers_replaced(
+        env: &Env,
+        actor: &Address,
+        old_count: u32,
+        new_count: u32,
+    ) {
+        storage::create_audit_entry(env, AuditAction::SignersReplaced, actor, 0);
+        events::emit_signers_replaced(env, actor, old_count, new_count);
     }
 
     // ========================================================================
@@ -5505,6 +5590,14 @@ impl VaultDAO {
         }
         if config.spending_limit <= 0 || config.daily_limit <= 0 || config.weekly_limit <= 0 {
             return Err(VaultError::InvalidAmount);
+        }
+        // Issue #1692: reject duplicate signer addresses.
+        for i in 0..config.signers.len() {
+            for j in (i + 1)..config.signers.len() {
+                if config.signers.get(i).unwrap() == config.signers.get(j).unwrap() {
+                    return Err(VaultError::SignerAlreadyExists);
+                }
+            }
         }
         Ok(())
     }

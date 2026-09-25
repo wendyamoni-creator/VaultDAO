@@ -2084,3 +2084,19 @@ pub fn emit_velocity_warning(env: &Env, addr: &Address, remaining_capacity: u32)
         remaining_capacity,
     );
 }
+
+// ============================================================================
+// Issue #1692: Signers Replaced Event
+// ============================================================================
+
+/// Emit when the entire signer set is replaced via a governance-approved
+/// config-change proposal.
+///
+/// Topics: `("signers_replaced",)`
+/// Data:   `(actor, old_count, new_count)`
+pub fn emit_signers_replaced(env: &Env, actor: &Address, old_count: u32, new_count: u32) {
+    env.events().publish(
+        (Symbol::new(env, "signers_replaced"),),
+        (actor.clone(), old_count, new_count),
+    );
+}
