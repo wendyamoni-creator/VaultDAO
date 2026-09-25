@@ -93,6 +93,9 @@ pub enum VaultError {
     // Issue #1064: Streaming Rate Limiter
     StreamRateLimitExceeded = 230,
     StreamDustRejected = 231,
+    // Issue #1694: trigger_stream_payment accrual check
+    /// Requested withdrawal exceeds the amount accrued by the stream so far
+    StreamClaimExceedsAccrued = 233,
     // Issue #1075: Insurance Claim Governance
     ClaimNotFound = 240,
     ClaimNotPending = 241,

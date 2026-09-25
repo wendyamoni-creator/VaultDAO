@@ -455,8 +455,8 @@ mod test_staking_slashing;
 // mod test_stream_pause_ttl;
 #[cfg(test)]
 mod test_streaming;
-// #[cfg(test)]
-// mod test_subscription_downgrade_grace;
+#[cfg(test)]
+mod test_trigger_stream_payment_accrual;
 #[cfg(test)]
 mod test_participation_scoring;
 #[cfg(test)]
@@ -4049,6 +4049,33 @@ impl VaultDAO {
             return Err(VaultError::StreamDustRejected);
         }
 
+        // ── Issue #1694: Accrual-bound check ────────────────────────────────
+        // Compute exactly how many tokens have accrued but not yet been claimed,
+        // using the same logic as claim_stream.  Reject any request that asks
+        // for more than that amount or more than what remains in total_amount.
+        let now = env.ledger().timestamp();
+
+        // Roll accumulated_seconds forward to the current moment (capping at
+        // end_timestamp so we never over-accrue beyond the stream's lifetime).
+        let effective_now = if now > stream.end_timestamp {
+            stream.end_timestamp
+        } else {
+            now
+        };
+        let elapsed_since_update = effective_now.saturating_sub(stream.last_update_timestamp);
+        let total_active_seconds = stream.accumulated_seconds + elapsed_since_update;
+
+        // gross_claimable = rate * total_active_seconds, capped at total_amount
+        let gross_claimable = (stream.rate * total_active_seconds as i128)
+            .min(stream.total_amount);
+        // net claimable = gross − already_claimed
+        let claimable = gross_claimable.saturating_sub(stream.claimed_amount);
+
+        if amount > claimable {
+            return Err(VaultError::StreamClaimExceedsAccrued);
+        }
+        // ────────────────────────────────────────────────────────────────────
+
         let config = storage::get_config(&env)?;
         let current_ledger = env.ledger().sequence();
 
@@ -4093,9 +4120,14 @@ impl VaultDAO {
         // Execute transfer
         token::transfer(&env, &stream.token_addr, &stream.recipient, amount);
 
-        // Update stream accounting
+        // ── Issue #1694: Roll accumulated_seconds before updating timestamp ─
+        // Must snapshot the elapsed seconds into accumulated_seconds *before*
+        // overwriting last_update_timestamp, otherwise the next claim will
+        // double-count (or miss) the seconds since this trigger.
+        stream.accumulated_seconds = total_active_seconds;
         stream.claimed_amount += amount;
-        stream.last_update_timestamp = env.ledger().timestamp();
+        stream.last_update_timestamp = now;
+        // ────────────────────────────────────────────────────────────────────
 
         // Mark completed if fully claimed
         if stream.claimed_amount >= stream.total_amount {
