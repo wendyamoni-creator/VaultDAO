@@ -1128,6 +1128,22 @@ pub fn emit_recovery_config_updated(env: &Env, admin: &Address) {
         .publish((Symbol::new(env, "recovery_config"),), admin.clone());
 }
 
+/// Emit when a recovery config change proposal is created (Issue #1702)
+pub fn emit_recovery_config_proposal_created(env: &Env, proposal_id: u64, proposer: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "recovery_config_proposal_created"), proposal_id),
+        proposer.clone(),
+    );
+}
+
+/// Emit when a recovery config change proposal is approved (Issue #1702)
+pub fn emit_recovery_config_proposal_approved(env: &Env, proposal_id: u64, voter: &Address, approval_count: u32) {
+    env.events().publish(
+        (Symbol::new(env, "recovery_config_proposal_approved"), proposal_id),
+        (voter.clone(), approval_count),
+    );
+}
+
 /// Emit when a recovery proposal is created
 pub fn emit_recovery_proposed(env: &Env, proposal_id: u64, new_threshold: u32) {
     env.events().publish(
@@ -1148,6 +1164,23 @@ pub fn emit_recovery_approved(env: &Env, proposal_id: u64, guardian: &Address) {
 pub fn emit_recovery_executed(env: &Env, proposal_id: u64) {
     env.events()
         .publish((Symbol::new(env, "recovery_executed"), proposal_id), ());
+}
+
+/// Emit when in-flight proposals are invalidated because the signer set changed
+/// through a recovery execution. `affected_ids` contains every proposal whose
+/// approval slate was wiped and whose status was reset to Pending.
+pub fn emit_proposals_invalidated_by_recovery(
+    env: &Env,
+    recovery_proposal_id: u64,
+    affected_ids: Vec<u64>,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "proposals_invalidated"),
+            recovery_proposal_id,
+        ),
+        affected_ids,
+    );
 }
 
 /// Emit when a recovery proposal is cancelled
@@ -2082,5 +2115,21 @@ pub fn emit_velocity_warning(env: &Env, addr: &Address, remaining_capacity: u32)
     env.events().publish(
         (Symbol::new(env, "velocity_warning"), addr.clone()),
         remaining_capacity,
+    );
+}
+
+// ============================================================================
+// Issue #1692: Signers Replaced Event
+// ============================================================================
+
+/// Emit when the entire signer set is replaced via a governance-approved
+/// config-change proposal.
+///
+/// Topics: `("signers_replaced",)`
+/// Data:   `(actor, old_count, new_count)`
+pub fn emit_signers_replaced(env: &Env, actor: &Address, old_count: u32, new_count: u32) {
+    env.events().publish(
+        (Symbol::new(env, "signers_replaced"),),
+        (actor.clone(), old_count, new_count),
     );
 }
