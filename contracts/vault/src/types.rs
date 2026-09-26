@@ -1790,6 +1790,27 @@ pub struct RecoveryProposal {
     /// Earliest ledger when this recovery can be executed
     pub execution_after: u64,
 }
+
+/// Recovery configuration change proposal (Issue #1702)
+/// Routes recovery config changes through multisig governance with timelock.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecoveryConfigChangeProposal {
+    pub id: u64,
+    /// Address proposing the change
+    pub proposer: Address,
+    /// New recovery configuration
+    pub new_config: RecoveryConfig,
+    /// Signers who have approved this proposal
+    pub approvals: Vec<Address>,
+    /// Current status
+    pub status: ProposalStatus,
+    /// Ledger when the proposal was created
+    pub created_at: u64,
+    /// Expiration ledger for voting
+    pub expires_at: u64,
+}
+
 // ============================================================================
 // Escrow System (Issue: feature/escrow-system)
 // ============================================================================
@@ -2782,7 +2803,7 @@ impl ColdSignerConfig {
             cold_signers: Vec::new(env),
             cold_signer_addresses: Vec::new(env),
             cold_sig_threshold: 0,
-            cold_sig_expiry: 17280, // ~1 day at 5 s/ledger
+            cold_sig_expiry: 17280,            // ~1 day at 5 s/ledger
             max_cold_sig_age_ledgers: 120_960, // ~7 days at 5 s/ledger
         }
     }
