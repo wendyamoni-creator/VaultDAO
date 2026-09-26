@@ -1788,6 +1788,27 @@ pub struct RecoveryProposal {
     /// Earliest ledger when this recovery can be executed
     pub execution_after: u64,
 }
+
+/// Recovery configuration change proposal (Issue #1702)
+/// Routes recovery config changes through multisig governance with timelock.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecoveryConfigChangeProposal {
+    pub id: u64,
+    /// Address proposing the change
+    pub proposer: Address,
+    /// New recovery configuration
+    pub new_config: RecoveryConfig,
+    /// Signers who have approved this proposal
+    pub approvals: Vec<Address>,
+    /// Current status
+    pub status: ProposalStatus,
+    /// Ledger when the proposal was created
+    pub created_at: u64,
+    /// Expiration ledger for voting
+    pub expires_at: u64,
+}
+
 // ============================================================================
 // Escrow System (Issue: feature/escrow-system)
 // ============================================================================

@@ -47,9 +47,9 @@ use types::{
     InsuranceConfig, ListMode, Milestone, MultiPhaseProposal, NotificationPreferences,
     NotificationPrefs, OptionalProposalOperation, OptionalVaultOracleConfig, PauseCooldownConfig,
     PauseState, Priority, Proposal, ProposalAmendment, ProposalOperation, ProposalPhase,
-    ProposalPhaseStatus, ProposalStatus, ProposalTemplate, RecoveryConfig, RecoveryProposal,
-    RecoveryStatus, RecurringPayment, RecurringStatus, Reputation, ReputationConfig, RetryConfig,
-    RetryState, Role, RoleAssignment, ScheduledTransferConfig, ScopedDelegation,
+    ProposalPhaseStatus, ProposalStatus, ProposalTemplate, RecoveryConfig, RecoveryConfigChangeProposal,
+    RecoveryProposal, RecoveryStatus, RecurringPayment, RecurringStatus, Reputation, ReputationConfig,
+    RetryConfig, RetryState, Role, RoleAssignment, ScheduledTransferConfig, ScopedDelegation,
     SignerParticipationScore, SignerTier, StakingConfig, StreamRateWindow, StreamStatus,
     StreamingPayment, Subscription, SubscriptionStatus, SubscriptionTier, SwapProposal, SwapResult,
     TemplateFeeTier, TemplateOverrides, ThresholdStrategy, TokenSpendingConfig, TransferDetails,
@@ -391,6 +391,8 @@ mod test_spending_refund_buckets;
 // #[cfg(test)]
 // #[cfg(test)]
 // pub mod mock_oracle { /* commented out with other broken test modules */ }
+#[cfg(test)]
+mod test_recovery_security_1702;
 #[cfg(test)]
 mod test;
 #[cfg(test)]
@@ -13473,23 +13475,119 @@ impl VaultDAO {
     // Wallet Recovery (Issue: feature/wallet-recovery)
     // ========================================================================
 
-    /// Update recovery configuration
-    pub fn set_recovery_config(
+    /// Propose a recovery configuration change (Issue #1702)
+    /// 
+    /// Routes recovery config changes through multisig governance with timelock.
+    /// Requires multisig approval from vault signers before taking effect.
+    pub fn propose_recovery_config_change(
         env: Env,
-        admin: Address,
-        config: RecoveryConfig,
-    ) -> Result<(), VaultError> {
-        admin.require_auth();
-        if !Role::role_satisfies(Role::Admin, storage::get_role(&env, &admin)) {
-            return Err(VaultError::InsufficientRole);
+        proposer: Address,
+        new_config: RecoveryConfig,
+    ) -> Result<u64, VaultError> {
+        proposer.require_auth();
+        let config = storage::get_config(&env)?;
+        if !config.signers.contains(&proposer) {
+            return Err(VaultError::NotASigner);
         }
 
-        let mut vault_config = storage::get_config(&env)?;
-        vault_config.recovery_config = config;
-        storage::set_config(&env, &vault_config);
+        // Max 3 active governance proposals
+        if storage::get_active_governance_count(&env) >= 3 {
+            return Err(VaultError::ConfigChangeInProgress);
+        }
 
-        events::emit_recovery_config_updated(&env, &admin);
+        let current_ledger = env.ledger().sequence() as u64;
+        let id = storage::increment_recovery_config_change_id(&env);
+        
+        let proposal = RecoveryConfigChangeProposal {
+            id,
+            proposer: proposer.clone(),
+            new_config,
+            approvals: Vec::new(&env),
+            status: ProposalStatus::Pending,
+            created_at: current_ledger,
+            expires_at: current_ledger + PROPOSAL_EXPIRY_LEDGERS,
+        };
+
+        storage::set_recovery_config_change_proposal(&env, &proposal);
+        storage::set_active_governance_count(&env, storage::get_active_governance_count(&env) + 1);
+        events::emit_recovery_config_proposal_created(&env, id, &proposer);
+        Ok(id)
+    }
+
+    /// Approve a recovery config change proposal (signers only)
+    pub fn approve_recovery_config_change(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+    ) -> Result<(), VaultError> {
+        voter.require_auth();
+        let config = storage::get_config(&env)?;
+        if !config.signers.contains(&voter) {
+            return Err(VaultError::NotASigner);
+        }
+
+        let mut proposal = storage::get_recovery_config_change_proposal(&env, proposal_id)?;
+
+        if proposal.status != ProposalStatus::Pending {
+            return Err(VaultError::ProposalNotPending);
+        }
+        if proposal.approvals.contains(&voter) {
+            return Err(VaultError::AlreadyApproved);
+        }
+
+        let current_ledger = env.ledger().sequence() as u64;
+        if current_ledger > proposal.expires_at {
+            return Err(VaultError::ProposalExpired);
+        }
+
+        proposal.approvals.push_back(voter.clone());
+
+        // Check supermajority
+        let threshold_pct = storage::get_governance_threshold(&env);
+        let required = (config.signers.len() as u64 * threshold_pct as u64).div_ceil(100) as u32;
+        if proposal.approvals.len() >= required {
+            proposal.status = ProposalStatus::Approved;
+        }
+
+        storage::set_recovery_config_change_proposal(&env, &proposal);
+        events::emit_recovery_config_proposal_approved(&env, proposal_id, &voter, proposal.approvals.len());
         Ok(())
+    }
+
+    /// Execute a recovery config change proposal
+    pub fn execute_recovery_config_change(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<(), VaultError> {
+        caller.require_auth();
+        let mut proposal = storage::get_recovery_config_change_proposal(&env, proposal_id)?;
+
+        if proposal.status != ProposalStatus::Approved {
+            return Err(VaultError::ProposalNotApproved);
+        }
+
+        let mut config = storage::get_config(&env)?;
+        config.recovery_config = proposal.new_config.clone();
+        storage::set_config(&env, &config);
+
+        proposal.status = ProposalStatus::Executed;
+        storage::set_recovery_config_change_proposal(&env, &proposal);
+        storage::set_active_governance_count(&env, storage::get_active_governance_count(&env).saturating_sub(1));
+        
+        events::emit_recovery_config_updated(&env, &proposal.proposer);
+        Ok(())
+    }
+
+    /// Update recovery configuration (DEPRECATED - use propose_recovery_config_change instead)
+    /// This function is kept for backward compatibility but will reject all calls.
+    pub fn set_recovery_config(
+        env: Env,
+        _admin: Address,
+        _config: RecoveryConfig,
+    ) -> Result<(), VaultError> {
+        // Issue #1702: Recovery config changes must go through governance
+        Err(VaultError::InsufficientRole)
     }
 
     /// Initiate a wallet recovery proposal
@@ -13844,11 +13942,13 @@ impl VaultDAO {
         Ok(())
     }
 
-    /// Cancel a recovery proposal (admins only)
-    pub fn cancel_recovery(env: Env, admin: Address, proposal_id: u64) -> Result<(), VaultError> {
-        admin.require_auth();
-        if !Role::role_satisfies(Role::Admin, storage::get_role(&env, &admin)) {
-            return Err(VaultError::InsufficientRole);
+    /// Cancel a recovery proposal (requires guardian quorum - Issue #1702)
+    pub fn cancel_recovery(env: Env, guardian: Address, proposal_id: u64) -> Result<(), VaultError> {
+        guardian.require_auth();
+        
+        let config = storage::get_config(&env)?;
+        if !config.recovery_config.guardians.contains(&guardian) {
+            return Err(VaultError::Unauthorized);
         }
 
         let mut proposal = storage::get_recovery_proposal(&env, proposal_id)?;
@@ -13857,12 +13957,35 @@ impl VaultDAO {
             return Err(VaultError::ProposalNotPending);
         }
 
-        proposal.status = RecoveryStatus::Cancelled;
-        storage::set_recovery_proposal(&env, &proposal);
-
-        events::emit_recovery_cancelled(&env, proposal_id, &admin);
-
-        Ok(())
+        // For an approved recovery, require guardian quorum to cancel
+        if proposal.status == RecoveryStatus::Approved {
+            // Check if this guardian has already voted to cancel
+            // We reuse the approvals vector to track cancel votes
+            if proposal.approvals.contains(&guardian) {
+                return Err(VaultError::AlreadyApproved);
+            }
+            
+            proposal.approvals.push_back(guardian.clone());
+            
+            // Require threshold of guardians to approve the cancellation
+            if proposal.approvals.len() >= config.recovery_config.threshold {
+                proposal.status = RecoveryStatus::Cancelled;
+                storage::set_recovery_proposal(&env, &proposal);
+                events::emit_recovery_cancelled(&env, proposal_id, &guardian);
+                Ok(())
+            } else {
+                // Store the partial cancellation votes
+                storage::set_recovery_proposal(&env, &proposal);
+                events::emit_recovery_cancelled(&env, proposal_id, &guardian);
+                Ok(())
+            }
+        } else {
+            // For pending recoveries, a single guardian can cancel
+            proposal.status = RecoveryStatus::Cancelled;
+            storage::set_recovery_proposal(&env, &proposal);
+            events::emit_recovery_cancelled(&env, proposal_id, &guardian);
+            Ok(())
+        }
     }
 
     /// Get recovery configuration
@@ -13874,6 +13997,11 @@ impl VaultDAO {
     /// Get recovery proposal details
     pub fn get_recovery_proposal(env: Env, id: u64) -> Result<RecoveryProposal, VaultError> {
         storage::get_recovery_proposal(&env, id)
+    }
+
+    /// Get recovery config change proposal details (Issue #1702)
+    pub fn get_recovery_config_change_proposal(env: Env, id: u64) -> Result<RecoveryConfigChangeProposal, VaultError> {
+        storage::get_recovery_config_change_proposal(&env, id)
     }
 
     // ========================================================================

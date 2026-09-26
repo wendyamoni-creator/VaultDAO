@@ -1128,6 +1128,22 @@ pub fn emit_recovery_config_updated(env: &Env, admin: &Address) {
         .publish((Symbol::new(env, "recovery_config"),), admin.clone());
 }
 
+/// Emit when a recovery config change proposal is created (Issue #1702)
+pub fn emit_recovery_config_proposal_created(env: &Env, proposal_id: u64, proposer: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "recovery_config_proposal_created"), proposal_id),
+        proposer.clone(),
+    );
+}
+
+/// Emit when a recovery config change proposal is approved (Issue #1702)
+pub fn emit_recovery_config_proposal_approved(env: &Env, proposal_id: u64, voter: &Address, approval_count: u32) {
+    env.events().publish(
+        (Symbol::new(env, "recovery_config_proposal_approved"), proposal_id),
+        (voter.clone(), approval_count),
+    );
+}
+
 /// Emit when a recovery proposal is created
 pub fn emit_recovery_proposed(env: &Env, proposal_id: u64, new_threshold: u32) {
     env.events().publish(

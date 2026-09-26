@@ -226,6 +226,7 @@ pub enum CounterKey {
     FundingRound = 6,
     Batch = 7,
     ScopedDelegation = 8,
+    RecoveryConfigChange = 9,
 }
 
 #[contracttype(export = false)]
@@ -331,6 +332,8 @@ pub enum FeatureKey {
     ThresholdReduced(u64),
     /// Recovery proposal by ID -> RecoveryProposal
     RecoveryProposal(u64),
+    /// Recovery config change proposal by ID -> RecoveryConfigChangeProposal (Issue #1702)
+    RecoveryConfigChangeProposal(u64),
     /// Insurance pool accumulated slashed funds (Token Address) -> i128
     /// Funding round by ID -> FundingRound
     FundingRound(u64),
@@ -3022,6 +3025,40 @@ pub fn get_recovery_proposal(env: &Env, id: u64) -> Result<RecoveryProposal, Vau
     env.storage()
         .persistent()
         .get(&FeatureKey::RecoveryProposal(id))
+        .ok_or(VaultError::ProposalNotFound)
+}
+
+// ============================================================================
+// Recovery Config Change Proposals (Issue #1702)
+// ============================================================================
+
+fn get_next_recovery_config_change_id(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&FeatureKey::Counter(CounterKey::RecoveryConfigChange))
+        .unwrap_or(1)
+}
+
+pub fn increment_recovery_config_change_id(env: &Env) -> u64 {
+    let id = get_next_recovery_config_change_id(env);
+    env.storage()
+        .instance()
+        .set(&FeatureKey::Counter(CounterKey::RecoveryConfigChange), &(id + 1));
+    id
+}
+
+pub fn set_recovery_config_change_proposal(env: &Env, proposal: &RecoveryConfigChangeProposal) {
+    let key = FeatureKey::RecoveryConfigChangeProposal(proposal.id);
+    env.storage().persistent().set(&key, proposal);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PROPOSAL_TTL / 2, PROPOSAL_TTL);
+}
+
+pub fn get_recovery_config_change_proposal(env: &Env, id: u64) -> Result<RecoveryConfigChangeProposal, VaultError> {
+    env.storage()
+        .persistent()
+        .get(&FeatureKey::RecoveryConfigChangeProposal(id))
         .ok_or(VaultError::ProposalNotFound)
 }
 
